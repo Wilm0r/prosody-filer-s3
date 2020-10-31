@@ -6,23 +6,25 @@
 package main
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"flag"
-	"fmt"
-	"io"
 	"io/ioutil"
 	"log"
 	"mime"
 	"net/http"
 	"net/url"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/BurntSushi/toml"
+
+	minio "github.com/minio/minio-go"
+	"github.com/minio/minio-go/pkg/credentials"
 )
 
 /*
@@ -31,12 +33,20 @@ import (
 type Config struct {
 	Listenport   string
 	Secret       string
-	Storedir     string
 	UploadSubDir string
+
+	ProxyMode bool
+
+	S3Endpoint  string
+	S3AccessKey string
+	S3Secret    string
+	S3TLS       bool
+	S3Bucket    string
 }
 
 var conf Config
-var versionString string = "0.0.0"
+var s3Client *minio.Client
+
 const ALLOWED_METHODS string = "OPTIONS, HEAD, GET, PUT"
 
 /*
@@ -77,11 +87,9 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		// Check if MAC is attached to URL
 		if a["v"] == nil {
 			log.Println("Error: No HMAC attached to URL.")
-			http.Error(w, "409 Conflict", 409)
+			http.Error(w, "Needs HMAC", 403)
 			return
 		}
-
-		fmt.Println("MAC sent: ", a["v"][0])
 
 		/*
 		 * Check if the request is valid
@@ -95,65 +103,53 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		/*
 		 * Check whether calculated (expected) MAC is the MAC that client send in "v" URL parameter
 		 */
-		if hmac.Equal([]byte(macString), []byte(a["v"][0])) {
-			// Make sure the path exists
-			os.MkdirAll(filepath.Dir(conf.Storedir+fileStorePath), os.ModePerm)
-
-			file, err := os.OpenFile(conf.Storedir+fileStorePath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0755)
-			defer file.Close()
-			if err != nil {
-				log.Println("Creating new file failed:", err)
-				http.Error(w, "409 Conflict", 409)
-				return
-			}
-
-			n, err := io.Copy(file, r.Body)
-			if err != nil {
-				log.Println("Writing to new file failed:", err)
-				http.Error(w, "500 Internal Server Error", 500)
-				return
-			}
-
-			log.Println("Successfully written", n, "bytes to file", fileStorePath)
-			w.WriteHeader(http.StatusCreated)
-		} else {
-			log.Println("Invalid MAC.")
+		if !hmac.Equal([]byte(macString), []byte(a["v"][0])) {
+			log.Println("Invalid MAC, expected:", macString)
 			http.Error(w, "403 Forbidden", 403)
 			return
 		}
-	} else if r.Method == "HEAD" {
-		fileinfo, err := os.Stat(conf.Storedir + fileStorePath)
+
+		// TODO: Overwrite check?
+		// TODO: Expire policy?
+		s3file, err := s3Client.PutObject(context.Background(), conf.S3Bucket, fileStorePath, r.Body, r.ContentLength, minio.PutObjectOptions{})
 		if err != nil {
-			log.Println("Getting file information failed:", err)
-			http.Error(w, "404 Not Found", 404)
+			log.Println("Uploading file failed:", err)
+			http.Error(w, "Backend Error", 502)
 			return
 		}
 
-		/*
-		 * Find out the content type to sent correct header. There is a Go function for retrieving the
-		 * MIME content type, but this does not work with encrypted files (=> OMEMO). Therefore we're just
-		 * relying on file extensions.
-		 */
-		contentType := mime.TypeByExtension(filepath.Ext(fileStorePath))
-		w.Header().Set("Content-Length", strconv.FormatInt(fileinfo.Size(), 10))
-		w.Header().Set("Content-Type", contentType)
-	} else if r.Method == "GET" {
-		contentType := mime.TypeByExtension(filepath.Ext(fileStorePath))
-		if f, err := os.Stat(conf.Storedir + fileStorePath); err != nil || f.IsDir() {
-			log.Println("Directory listing forbidden!")
-			http.Error(w, "403 Forbidden", 403)
-			return
+		log.Println("Successfully stored file with ETag", s3file.ETag)
+		w.WriteHeader(http.StatusCreated)
+	} else if r.Method == "HEAD" || r.Method == "GET" {
+		if conf.ProxyMode {
+			obj, err := s3Client.GetObject(context.Background(), conf.S3Bucket, fileStorePath, minio.GetObjectOptions{})
+			if err != nil {
+				log.Println("Storage error:", err)
+				http.Error(w, "Storage error", 502)
+				return
+			}
+			contentType := mime.TypeByExtension(filepath.Ext(fileStorePath))
+			w.Header().Set("Content-Type", contentType)
+			if r.Method == "GET" {
+				http.ServeContent(w, r, fileStorePath, time.Now(), obj)
+			}
+
+		} else {
+			url, err := s3Client.PresignedGetObject(context.Background(), conf.S3Bucket, fileStorePath, 24*time.Hour, url.Values{})
+			if err != nil {
+				log.Println("Storage error:", err)
+				http.Error(w, "Storage error", 502)
+				return
+			}
+
+			w.Header().Set("Location", url.String())
+			w.WriteHeader(http.StatusFound) // better known as 302
 		}
-		if contentType == "" {
-			contentType = "application/octet-stream"
-		}
-		http.ServeFile(w, r, conf.Storedir+fileStorePath)
-		w.Header().Set("Content-Type", contentType)
 	} else if r.Method == "OPTIONS" {
 		w.Header().Set("Allow", ALLOWED_METHODS)
 		return
 	} else {
-		log.Println("Invalid method", r.Method, "for access to ", conf.UploadSubDir)
+		log.Println("Invalid method", r.Method)
 		http.Error(w, "405 Method Not Allowed", 405)
 		return
 	}
@@ -194,11 +190,31 @@ func main() {
 		log.Println("There was an error while reading the configuration file:", err)
 	}
 
+	log.Println("Starting Prosody-Filer-S3...")
+
+	s3Client, err = minio.New(conf.S3Endpoint, &minio.Options{
+		Creds:  credentials.NewStaticV4(conf.S3AccessKey, conf.S3Secret, ""),
+		Secure: conf.S3TLS,
+	})
+	if err != nil {
+		log.Fatalln(err)
+	}
+	exists, err := s3Client.BucketExists(context.Background(), conf.S3Bucket)
+	if err != nil {
+		log.Fatalln(err)
+	}
+	if !exists {
+		log.Fatalln("Bucket does not exist: " + conf.S3Bucket)
+	}
+	log.Println("S3 bucket found.")
+
 	/*
 	 * Start HTTP server
 	 */
-	log.Println("Starting Prosody-Filer", versionString, "...")
 	http.HandleFunc("/"+conf.UploadSubDir, handleRequest)
-	log.Printf("Server started on port %s. Waiting for requests.\n", conf.Listenport)
-	http.ListenAndServe(conf.Listenport, nil)
+	log.Printf("Server started on %s. Waiting for requests.\n", conf.Listenport)
+	err = http.ListenAndServe(conf.Listenport, nil)
+	if err != nil {
+		log.Fatalln(err)
+	}
 }
