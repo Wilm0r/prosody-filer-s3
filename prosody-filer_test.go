@@ -9,44 +9,28 @@ package main
 
 import (
 	"bytes"
-	"io"
+	"context"
+	"fmt"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"testing"
+
+	minio "github.com/minio/minio-go"
 )
 
 func mockUpload() {
-	os.MkdirAll(filepath.Dir(conf.Storedir+"thomas/abc/"), os.ModePerm)
-	from, err := os.Open("./catmetal.jpg")
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer from.Close()
-
-	to, err := os.OpenFile(conf.Storedir+"thomas/abc/catmetal.jpg", os.O_RDWR|os.O_CREATE, 0660)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer to.Close()
-
-	_, err = io.Copy(to, from)
+	_, err := s3Client.FPutObject(context.Background(), conf.S3Bucket, "/thomas/abc/catmetal.jpg", "./catmetal.jpg", minio.PutObjectOptions{})
 	if err != nil {
 		log.Fatal(err)
 	}
 }
 
 func cleanup() {
-	// Clean up
-	if _, err := os.Stat(conf.Storedir); err == nil {
-		// Delete existing catmetal picture
-		err := os.RemoveAll(conf.Storedir)
-		if err != nil {
-			log.Println("Error while cleaning up:", err)
-		}
+	err := s3Client.RemoveObject(context.Background(), conf.S3Bucket, "/thomas/abc/catmetal.jpg", minio.RemoveObjectOptions{})
+	if err != nil {
+		log.Fatal(err)
 	}
 }
 
@@ -61,6 +45,7 @@ func TestReadConfig(t *testing.T) {
 func TestUploadValid(t *testing.T) {
 	// Set config
 	readConfig("config.toml", &conf)
+	s3Login()
 
 	// Read catmetal file
 	catmetalfile, err := ioutil.ReadFile("catmetal.jpg")
@@ -71,7 +56,7 @@ func TestUploadValid(t *testing.T) {
 	// Create request
 	req, err := http.NewRequest("PUT", "/upload/thomas/abc/catmetal.jpg", bytes.NewBuffer(catmetalfile))
 	q := req.URL.Query()
-	q.Add("v", "e17531b1e88bc9a5cbf816eca8a82fc09969c9245250f3e1b2e473bb564e4be0")
+	q.Add("v", "1924ba5c934977747c91039b772b460664e5cee4104ae85c31449114ad194cfa")
 	req.URL.RawQuery = q.Encode()
 
 	if err != nil {
@@ -85,7 +70,7 @@ func TestUploadValid(t *testing.T) {
 	handler.ServeHTTP(rr, req)
 
 	// Check status code
-	if status := rr.Code; status != http.StatusOK {
+	if status := rr.Code; status != http.StatusCreated {
 		t.Errorf("handler returned wrong status code: got %v want %v. HTTP body: %s", status, http.StatusOK, rr.Body.String())
 	}
 
@@ -96,6 +81,7 @@ func TestUploadValid(t *testing.T) {
 func TestUploadMissingMAC(t *testing.T) {
 	// Set config
 	readConfig("config.toml", &conf)
+	s3Login()
 
 	// Read catmetal file
 	catmetalfile, err := ioutil.ReadFile("catmetal.jpg")
@@ -117,14 +103,15 @@ func TestUploadMissingMAC(t *testing.T) {
 	handler.ServeHTTP(rr, req)
 
 	// Check status code
-	if status := rr.Code; status != http.StatusConflict {
-		t.Errorf("handler returned wrong status code: got %v want %v. HTTP body: %s", status, http.StatusConflict, rr.Body.String())
+	if status := rr.Code; status != http.StatusForbidden {
+		t.Errorf("handler returned wrong status code: got %v want %v. HTTP body: %s", status, http.StatusForbidden, rr.Body.String())
 	}
 }
 
 func TestUploadInvalidMAC(t *testing.T) {
 	// Set config
 	readConfig("config.toml", &conf)
+	s3Login()
 
 	// Read catmetal file
 	catmetalfile, err := ioutil.ReadFile("catmetal.jpg")
@@ -157,6 +144,7 @@ func TestUploadInvalidMAC(t *testing.T) {
 func TestUploadInvalidMethod(t *testing.T) {
 	// Set config
 	readConfig("config.toml", &conf)
+	s3Login()
 
 	// Read catmetal file
 	catmetalfile, err := ioutil.ReadFile("catmetal.jpg")
@@ -183,58 +171,41 @@ func TestUploadInvalidMethod(t *testing.T) {
 	}
 }
 
-func TestDownloadHead(t *testing.T) {
+func TestDownloadOK(t *testing.T) {
 	// Set config
 	readConfig("config.toml", &conf)
+	s3Login()
 
 	// Mock upload
 	mockUpload()
 
-	// Create request
-	req, err := http.NewRequest("HEAD", "/upload/thomas/abc/catmetal.jpg", nil)
+	for _, method := range []string{"GET", "HEAD"} {
+		for _, proxy := range []bool{false, true} {
+			conf.ProxyMode = proxy
+			t.Run(fmt.Sprintf("method %s proxy %t", method, proxy), func(t *testing.T) {
+				// Create request
+				req, err := http.NewRequest("HEAD", "/upload/thomas/abc/catmetal.jpg", nil)
 
-	if err != nil {
-		t.Fatal(err)
-	}
+				if err != nil {
+					t.Fatal(err)
+				}
 
-	rr := httptest.NewRecorder()
-	handler := http.HandlerFunc(handleRequest)
+				rr := httptest.NewRecorder()
+				handler := http.HandlerFunc(handleRequest)
 
-	// Send request and record response
-	handler.ServeHTTP(rr, req)
+				// Send request and record response
+				handler.ServeHTTP(rr, req)
 
-	// Check status code
-	if status := rr.Code; status != http.StatusOK {
-		t.Errorf("handler returned wrong status code: got %v want %v. HTTP body: %s", status, http.StatusOK, rr.Body.String())
-	}
-
-	// cleanup
-	cleanup()
-}
-
-func TestDownloadGet(t *testing.T) {
-	// Set config
-	readConfig("config.toml", &conf)
-
-	// moch upload
-	mockUpload()
-
-	// Create request
-	req, err := http.NewRequest("GET", "/upload/thomas/abc/catmetal.jpg", nil)
-
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	rr := httptest.NewRecorder()
-	handler := http.HandlerFunc(handleRequest)
-
-	// Send request and record response
-	handler.ServeHTTP(rr, req)
-
-	// Check status code
-	if status := rr.Code; status != http.StatusOK {
-		t.Errorf("handler returned wrong status code: got %v want %v. HTTP body: %s", status, http.StatusOK, rr.Body.String())
+				// Check status code
+				var wanted = http.StatusFound
+				if proxy {
+					wanted = http.StatusOK
+				}
+				if status := rr.Code; status != wanted {
+					t.Errorf("handler returned wrong status code: got %v want %v. HTTP body: %s", status, wanted, rr.Body.String())
+				}
+			})
+		}
 	}
 
 	// cleanup
@@ -244,6 +215,7 @@ func TestDownloadGet(t *testing.T) {
 func TestEmptyGet(t *testing.T) {
 	// Set config
 	readConfig("config.toml", &conf)
+	s3Login()
 
 	// Create request
 	req, err := http.NewRequest("GET", "", nil)
@@ -259,7 +231,7 @@ func TestEmptyGet(t *testing.T) {
 	handler.ServeHTTP(rr, req)
 
 	// Check status code
-	if status := rr.Code; status != http.StatusForbidden {
-		t.Errorf("handler returned wrong status code: got %v want %v. HTTP body: %s", status, http.StatusForbidden, rr.Body.String())
+	if status := rr.Code; status != http.StatusBadGateway {
+		t.Errorf("handler returned wrong status code: got %v want %v. HTTP body: %s", status, http.StatusBadGateway, rr.Body.String())
 	}
 }

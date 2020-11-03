@@ -1,3 +1,38 @@
+# Prosody Filer S3 fork
+
+A simple XMPP upload server (tested with Prosody only so far) that relies on S3 API compatible storage (tested against my own Ceph only) instead of local disk, so that you can run it without local state on Kubernetes/Docker.
+
+Like the original version, it aims to be thin and simple. It streams PUT operations directly to S3, and fetch operations will by default redirect to a signed request to S3, instead of sitting in between as an unnecessary bottleneck. (If you do prefer proxying, it can be enabled using the `ProxyMode` setting.)
+
+For automatic purging, I believe you should be able to set retention periods on your S3 bucket instead of running deletion cronjobs.
+
+## `config.toml` example
+
+```ini
+### IP address and port to listen to, e.g. "[::]:5050"
+ListenPort   = "0.0.0.0:5280"
+### Secret (must match the one in prosody.conf.lua!)
+Secret       =
+### Subdirectory for HTTP upload / download requests (usually "upload/", NO LEADING SLASH!)
+UploadSubDir = "upload/"
+
+### Hostname of S3 compatible endpoint
+S3Endpoint  = "s3.amazonaws.com"
+### HTTPS. True by default obviously, set to false if you must.
+S3TLS       = true
+### Credentials. Use AWS_ACCESS_KEY_ID environment variable if you prefer.
+S3AccessKey = "..."
+### Or AWS_SECRET_ACCESS_KEY environment variable.
+S3Secret    = "..."
+### Our S3 bucket name.
+S3Bucket    = "xmpp-uploads"
+
+### If your client doesn't deal well with the 302 redirects or signed URLs, enable this setting so Filer will proxy the data for you.
+ProxyMode = false
+```
+
+The rest of this manual covers the local-storage original Filer. The majority of it (except for Prosody/Ejabberd configuration) shouldn't apply to you if you're planning to run this Filer on k8s.
+
 # Prosody Filer
 
 A simple file server for handling XMPP http_upload requests. This server is meant to be used with the Prosody [mod_http_upload_external](https://modules.prosody.im/mod_http_upload_external.html) module.

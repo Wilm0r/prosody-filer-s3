@@ -16,7 +16,9 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
+	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -58,6 +60,16 @@ func addCORSheaders(w http.ResponseWriter) {
 	w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
 	w.Header().Set("Access-Control-Allow-Credentials", "true")
 	w.Header().Set("Access-Control-Max-Age", "7200")
+}
+
+func addContentHeaders(h http.Header, filename string) {
+	ctype := mime.TypeByExtension(filepath.Ext(filename))
+	h.Set("Content-Type", ctype)
+	if m, _ := regexp.MatchString("((audio|image|video)/.*|text/plain)", ctype); m {
+		h.Set("Content-Disposition", "inline")
+	} else {
+		h.Set("Content-Disposition", "attachment")
+	}
 }
 
 /*
@@ -109,8 +121,12 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// TODO: Overwrite check?
-		// TODO: Expire policy?
+		ch := make(http.Header)
+		addContentHeaders(ch, fileStorePath)
+		var opt minio.PutObjectOptions
+		opt.ContentType = ch.Get("Content-Type")
+		opt.ContentDisposition = ch.Get("Content-Disposition")
+
 		s3file, err := s3Client.PutObject(context.Background(), conf.S3Bucket, fileStorePath, r.Body, r.ContentLength, minio.PutObjectOptions{})
 		if err != nil {
 			log.Println("Uploading file failed:", err)
@@ -128,14 +144,20 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, "Storage error", 502)
 				return
 			}
-			contentType := mime.TypeByExtension(filepath.Ext(fileStorePath))
-			w.Header().Set("Content-Type", contentType)
+			addContentHeaders(w.Header(), fileStorePath)
 			if r.Method == "GET" {
 				http.ServeContent(w, r, fileStorePath, time.Now(), obj)
 			}
 
 		} else {
-			url, err := s3Client.PresignedGetObject(context.Background(), conf.S3Bucket, fileStorePath, 24*time.Hour, url.Values{})
+			ch := make(http.Header)
+			addContentHeaders(ch, fileStorePath)
+			uv := make(url.Values)
+			for k, v := range ch {
+				uv.Set("response-"+strings.ToLower(k), v[0])
+			}
+
+			url, err := s3Client.PresignedGetObject(context.Background(), conf.S3Bucket, fileStorePath, 24*time.Hour, uv)
 			if err != nil {
 				log.Println("Storage error:", err)
 				http.Error(w, "Storage error", 502)
@@ -158,6 +180,8 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 func readConfig(configfilename string, conf *Config) error {
 	log.Println("Reading configuration ...")
 
+	conf.S3TLS = true
+
 	configdata, err := ioutil.ReadFile(configfilename)
 	if err != nil {
 		log.Fatal("Configuration file config.toml cannot be read:", err, "...Exiting.")
@@ -169,7 +193,33 @@ func readConfig(configfilename string, conf *Config) error {
 		return err
 	}
 
+	// Support standard AWS credential env variables as well (will override whatever may have been in the config!)
+	if key, has := os.LookupEnv("AWS_ACCESS_KEY_ID"); has {
+		log.Println("Loading AWS credentials from evironment instead of config")
+		conf.S3AccessKey = key
+	}
+	if key, has := os.LookupEnv("AWS_SECRET_ACCESS_KEY"); has {
+		conf.S3Secret = key
+	}
 	return nil
+}
+
+func s3Login() {
+	var err error
+	s3Client, err = minio.New(conf.S3Endpoint, &minio.Options{
+		Creds:  credentials.NewStaticV4(conf.S3AccessKey, conf.S3Secret, ""),
+		Secure: conf.S3TLS,
+	})
+	if err != nil {
+		log.Fatalln(err)
+	}
+	exists, err := s3Client.BucketExists(context.Background(), conf.S3Bucket)
+	if err != nil {
+		log.Fatalln(err)
+	}
+	if !exists {
+		log.Fatalln("Bucket does not exist: " + conf.S3Bucket)
+	}
 }
 
 /*
@@ -191,21 +241,7 @@ func main() {
 	}
 
 	log.Println("Starting Prosody-Filer-S3...")
-
-	s3Client, err = minio.New(conf.S3Endpoint, &minio.Options{
-		Creds:  credentials.NewStaticV4(conf.S3AccessKey, conf.S3Secret, ""),
-		Secure: conf.S3TLS,
-	})
-	if err != nil {
-		log.Fatalln(err)
-	}
-	exists, err := s3Client.BucketExists(context.Background(), conf.S3Bucket)
-	if err != nil {
-		log.Fatalln(err)
-	}
-	if !exists {
-		log.Fatalln("Bucket does not exist: " + conf.S3Bucket)
-	}
+	s3Login()
 	log.Println("S3 bucket found.")
 
 	/*
