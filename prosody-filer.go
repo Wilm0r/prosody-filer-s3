@@ -123,6 +123,8 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 
 		ch := make(http.Header)
 		addContentHeaders(ch, fileStorePath)
+
+		// Somewhat redundant since we're setting these in the signed URL as well, but why not?
 		var opt minio.PutObjectOptions
 		opt.ContentType = ch.Get("Content-Type")
 		opt.ContentDisposition = ch.Get("Content-Disposition")
@@ -145,10 +147,10 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			addContentHeaders(w.Header(), fileStorePath)
+			// Content-Length for HEAD?
 			if r.Method == "GET" {
 				http.ServeContent(w, r, fileStorePath, time.Now(), obj)
 			}
-
 		} else {
 			ch := make(http.Header)
 			addContentHeaders(ch, fileStorePath)
@@ -157,6 +159,8 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 				uv.Set("response-"+strings.ToLower(k), v[0])
 			}
 
+			// NOTE: This is an offline operation, using just our credentials, so it'll work for any URL,
+			// it's up to the S3 backend to 404 if the file isn't there.
 			url, err := s3Client.PresignedGetObject(context.Background(), conf.S3Bucket, fileStorePath, 24*time.Hour, uv)
 			if err != nil {
 				log.Println("Storage error:", err)
@@ -218,7 +222,9 @@ func s3Login() {
 		log.Fatalln(err)
 	}
 	if !exists {
-		log.Fatalln("Bucket does not exist: " + conf.S3Bucket)
+		// Buggy example: Scaleway, appears to always report non-existent.
+		// But hey at least we've verified that the credentials work which is actually the main thing I want to check here.
+		log.Println("WARNING: Bucket does not exist (or S3 service is buggy): " + conf.S3Bucket)
 	}
 }
 
