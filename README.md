@@ -13,7 +13,8 @@ If you want automatic purging, just set [lifecycle policies](https://docs.aws.am
 ListenPort   = "0.0.0.0:5280"
 ### Secret (must match the one in prosody.conf.lua!)
 Secret       =
-### Subdirectory for HTTP upload / download requests (usually "upload/", NO to LEADING slash, YES to trailing!)
+### Subdirectory for HTTP upload / download requests (usually "upload/",
+### NO to LEADING slash, YES to trailing!)
 UploadSubDir = "upload/"
 
 ### Hostname of S3 compatible endpoint
@@ -27,7 +28,8 @@ S3Secret    = "..."
 ### Our S3 bucket name.
 S3Bucket    = "xmpp-filer"
 
-### If your client doesn't deal well with the 302 redirects or signed URLs, enable this setting so Filer will proxy the data for you.
+### If your client doesn't deal well with the 302 redirects or signed URLs,
+### enable this setting so Filer will proxy the data for you.
 ProxyMode = false
 ```
 
